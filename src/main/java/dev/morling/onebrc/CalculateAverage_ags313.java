@@ -23,6 +23,7 @@ import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
@@ -31,17 +32,17 @@ import java.util.concurrent.Future;
 
 public class CalculateAverage_ags313 {
 
-    private static final int THREAD_COUNT = 8;
+    private static final int THREAD_COUNT = 4; // against the hyper threads
     private static final int FUTURE_BUFFER = 1024;
-    private static final int ALLOCATION = 128 * 1024 * 1024;
+    private static final int ALLOCATION = 32 * 1024 * 1024; // wild guess
 
     // private static final String FILE = "./measurementsCut.txt";
     private static final String FILE = "./measurements.txt";
     // private static final String FILE = "./src/test/resources/samples/measurements-1.txt";
     // private static final String FILE = "./src/test/resources/samples/measurements-20.txt";
 
-    private static final int NAME_LENGTH_LIMIT_BYTES = 128;
-    private static final int BUFFER_SIZE = 108;
+    private static final int NAME_LENGTH_LIMIT_BYTES = 100;
+    private static final int MAX_LINE_LENGTH = 108; // 100 characters + ";-12.3\n"
     private static final ExecutorService exec = Executors.newFixedThreadPool(THREAD_COUNT);
 
     /**
@@ -55,13 +56,13 @@ public class CalculateAverage_ags313 {
      **/
 
     private static class Key implements Comparable<Key> {
-        private final byte[] value = new byte[NAME_LENGTH_LIMIT_BYTES];
+        private final long nameAddress = UNSAFE.allocateMemory(NAME_LENGTH_LIMIT_BYTES);
         private int hashCode;
         private int length = 0;
 
         // https://stackoverflow.com/questions/20952739/how-would-you-convert-a-string-to-a-64-bit-integer
         public void accept(byte b) {
-            value[length] = b;
+            UNSAFE.putByte(nameAddress + length, b);
             length += 1;
             hashCode = hashCode * 10191 + b;
         }
@@ -78,7 +79,7 @@ public class CalculateAverage_ags313 {
             if (length != key.length)
                 return false;
             for (int i = 0; i < length; i++) {
-                if (UNSAFE.getByte(value, i) != UNSAFE.getByte(key.value, i)) {
+                if (UNSAFE.getByte(nameAddress + i) != UNSAFE.getByte(nameAddress + i)) {
                     return false;
                 }
             }
@@ -93,7 +94,11 @@ public class CalculateAverage_ags313 {
 
         @Override
         public String toString() {
-            return new String(value, 0, length);
+            var bytes = new byte[length];
+            for (int i = 0; i < bytes.length; i++) {
+                bytes[i] = UNSAFE.getByte(nameAddress + i);
+            }
+            return new String(bytes, StandardCharsets.UTF_8);
         }
 
         void reset() {
@@ -115,9 +120,6 @@ public class CalculateAverage_ags313 {
         var key = new Key();
         while (bbuffer.remaining() > 1) {
             key.reset();
-            boolean negative = false;
-            var temperature = 0;
-
             while (bbuffer.remaining() > 0) {
                 byte b = bbuffer.get();
                 if (b == ';') {
@@ -126,6 +128,8 @@ public class CalculateAverage_ags313 {
                 key.accept(b);
             }
 
+            boolean negative = false;
+            var justDigits = 0;
             loop2: while (bbuffer.remaining() > 0) {
                 byte b = bbuffer.get();
                 switch (b) {
@@ -133,29 +137,22 @@ public class CalculateAverage_ags313 {
                         negative = true;
                         break;
                     case '.':
-                        temperature = (temperature * 10) + (bbuffer.get() - '0'); // single decimal
+                        justDigits = (justDigits * 10) + (bbuffer.get() - '0'); // single decimal
                         break;
                     case '\n':
                         break loop2;
                     default:
-                        temperature = (temperature * 10) + (b - '0');
+                        justDigits = (justDigits * 10) + (b - '0');
                 }
             }
 
-            int measure = negative ? -temperature : temperature;
+            int observation = negative ? -justDigits : justDigits;
             Stats stats = result.computeIfAbsent(key, c -> new Stats());
             if (stats.count == 0) {
                 key = new Key();
             }
 
-            stats.count++;
-            stats.total += measure;
-            if (measure < stats.min) {
-                stats.min = measure;
-            }
-            if (measure > stats.max) {
-                stats.max = measure;
-            }
+            stats.accept(observation);
         }
 
         return result;
@@ -173,26 +170,25 @@ public class CalculateAverage_ags313 {
             var start = allocated;
             var bytesToReadInPass = Math.min(totalToRead - allocated, ALLOCATION);
 
-            if (bytesToReadInPass < BUFFER_SIZE) {
+            if (bytesToReadInPass < MAX_LINE_LENGTH) {
                 // System.out.println("Want to read: " + bytesToReadInPass + ", starting buffer at: " + startBufferAt);
                 // System.out.println("Total: " + totalToRead + ", allocated: " + allocated + ", allocating: " + (correctedBytesToRead));
                 futures[chunkCounter++] = exec.submit(() -> readChunk(channel, start, (int) bytesToReadInPass));
                 allocated += bytesToReadInPass;
             }
             else {
-                var startBufferAt = Math.max(0, allocated + bytesToReadInPass - BUFFER_SIZE);
-                var buffer = channel.map(FileChannel.MapMode.READ_ONLY, startBufferAt, BUFFER_SIZE);
+                var startBufferAt = Math.max(0, allocated + bytesToReadInPass - MAX_LINE_LENGTH);
+                var buffer = channel.map(FileChannel.MapMode.READ_ONLY, startBufferAt, MAX_LINE_LENGTH);
 
                 // System.out.println("Want to read: " + bytesToReadInPass + ", starting buffer at: " + startBufferAt);
-
                 var endOfLine = 0;
-                for (int i = 0; i < BUFFER_SIZE; i++) {
+                for (int i = 0; i < MAX_LINE_LENGTH; i++) {
                     if (buffer.get() == '\n') {
                         endOfLine = i;
                         break;
                     }
                 }
-                long correctedBytesToRead = bytesToReadInPass - BUFFER_SIZE + endOfLine;
+                long correctedBytesToRead = bytesToReadInPass - MAX_LINE_LENGTH + endOfLine;
 
                 // System.out.println("Total: " + totalToRead + ", allocated: " + allocated + ", allocating: " + (correctedBytesToRead));
                 futures[chunkCounter++] = exec.submit(() -> readChunk(channel, start, (int) correctedBytesToRead));
@@ -232,6 +228,13 @@ public class CalculateAverage_ags313 {
             min = Math.min(this.min, that.min);
             total += that.total;
             count += that.count;
+        }
+
+        public void accept(int observation) {
+            count++;
+            total += observation;
+            max = Math.max(observation, this.max);
+            min = Math.min(observation, this.min);
         }
     }
 
