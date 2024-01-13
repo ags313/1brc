@@ -15,5 +15,5 @@
 #  limitations under the License.
 #
 
-JAVA_OPTS="-Xms1000M"
-time java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_hchiorean
+JAVA_OPTS="-Xms1000M -Xmx16G"
+java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_hchiorean
